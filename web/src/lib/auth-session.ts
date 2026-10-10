@@ -333,6 +333,11 @@ async function performRefreshWithBrowserLock(
 }
 
 export function refreshAuthentication(): Promise<RefreshOutcome> {
+  const auth = useAuthStore.getState().auth
+  if (auth.bootstrapState === 'complete' && !auth.user && !auth.session) {
+    return Promise.resolve({ kind: 'anonymous' })
+  }
+
   if (!refreshPromise) {
     const refreshEpoch = authEpoch
     refreshPromise = performRefreshWithBrowserLock(refreshEpoch).finally(() => {

@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient } from '@tanstack/react-query'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { useAuthStore, type AuthBundle } from '../stores/auth-store'
 import {
@@ -26,8 +26,18 @@ import {
   clearAuthenticatedClientState,
   createRefreshRunner,
   isAuthBundle,
+  refreshAuthentication,
   type AuthRefreshRuntime,
 } from './auth-session'
+
+const { refreshPost } = vi.hoisted(() => ({ refreshPost: vi.fn() }))
+
+vi.mock('axios', () => ({
+  default: {
+    create: () => ({ post: refreshPost }),
+    isAxiosError: () => false,
+  },
+}))
 
 const bundle: AuthBundle = {
   access_token: 'access-token',
@@ -51,6 +61,7 @@ const bundle: AuthBundle = {
 }
 
 afterEach(() => {
+  refreshPost.mockReset()
   useAuthStore.getState().auth.reset('idle')
 })
 
@@ -64,6 +75,81 @@ describe('authentication session coordination', () => {
       kind: 'authenticated',
       bundle,
     })
+  })
+
+  test('repeated refreshes do not poll after bootstrap confirms anonymous state', async () => {
+    useAuthStore.getState().auth.reset('complete')
+    refreshPost.mockResolvedValue({ status: 401 })
+
+    expect(await refreshAuthentication()).toEqual({ kind: 'anonymous' })
+    expect(await refreshAuthentication()).toEqual({ kind: 'anonymous' })
+    expect(refreshPost).not.toHaveBeenCalled()
+    expect(useAuthStore.getState().auth.bootstrapState).toBe('complete')
+  })
+
+  test('refresh remains eligible during a cold idle bootstrap', async () => {
+    useAuthStore.getState().auth.reset('idle')
+    refreshPost.mockResolvedValue({ status: 401, data: {} })
+
+    expect(await refreshAuthentication()).toEqual({ kind: 'anonymous' })
+    expect(refreshPost).toHaveBeenCalledOnce()
+  })
+
+  test('a stale session still refreshes after completed anonymous checks are guarded', async () => {
+    useAuthStore.getState().auth.setBundle({
+      ...bundle,
+      access_expires_at: Math.floor(Date.now() / 1000) - 1,
+    })
+    refreshPost.mockResolvedValue({
+      status: 200,
+      data: { success: true, data: bundle },
+    })
+
+    expect(await refreshAuthentication()).toEqual({
+      kind: 'authenticated',
+      bundle,
+    })
+    expect(refreshPost).toHaveBeenCalledOnce()
+  })
+
+  test('concurrent refresh requests share one refresh operation', async () => {
+    useAuthStore.getState().auth.reset('idle')
+    let resolveResponse:
+      | ((response: { status: number; data: unknown }) => void)
+      | undefined
+    refreshPost.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveResponse = resolve
+        })
+    )
+
+    const firstRefresh = refreshAuthentication()
+    const secondRefresh = refreshAuthentication()
+    expect(refreshPost).toHaveBeenCalledOnce()
+
+    resolveResponse?.({ status: 401, data: {} })
+    expect(await firstRefresh).toEqual({ kind: 'anonymous' })
+    expect(await secondRefresh).toEqual({ kind: 'anonymous' })
+  })
+
+  test('login after terminal anonymous state allows a new session refresh', async () => {
+    useAuthStore.getState().auth.reset('complete')
+    refreshPost.mockResolvedValue({ status: 401, data: {} })
+    expect(await refreshAuthentication()).toEqual({ kind: 'anonymous' })
+    expect(refreshPost).not.toHaveBeenCalled()
+
+    useAuthStore.getState().auth.setBundle(bundle)
+    refreshPost.mockResolvedValue({
+      status: 200,
+      data: { success: true, data: bundle },
+    })
+
+    expect(await refreshAuthentication()).toEqual({
+      kind: 'authenticated',
+      bundle,
+    })
+    expect(refreshPost).toHaveBeenCalledOnce()
   })
 
   test('a session mismatch clears only local state and retries without the stale SID', async () => {
